@@ -1,20 +1,16 @@
 
 name: remediation/Remediation-Keepalive
 
-run-name: remediation/Remediation-Keepalive-${{ inputs.InstanceId }}-${{ github.run_number }}
+run-name: remediation/Remediation-Keepalive-${{ github.run_number }}
 
 on:
   workflow_dispatch:
     inputs:
-      InstanceId:
+      Event:
         type: string
-        description: Instance ID
+        description: Event
         required: true
 
-      Region:
-        type: string
-        description: Region
-        required: true
 
 jobs:
   remediation-keepalive:
@@ -23,178 +19,11 @@ jobs:
       - name: Checkout Infra-Actions repo
         uses: actions/checkout@v3
 
-      - name: Set Up AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v3
-        with:
-          aws-access-key-id: AKIA4ZPZVNQC3PBRSPGI
-          aws-secret-access-key: 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
-          aws-region: ap-south-1
-
-      - name: Check EC2 instance state
-        id: ec2-state
+      - name: Parse and print JSON input
         run: |
-          state=$(aws ec2 describe-instances --instance-ids ${{ inputs.InstanceId }} \
-            --query 'Reservations[0].Instances[0].State.Name' --output text)
-          if [ "$state" != "running" ]; then
-            echo "Instance is not in running state. Current Instance status: $state"
-          fi
-          echo "STATE=$state" >> $GITHUB_OUTPUT
-
-      - name: Check CloudWatch metrics
-        if: ${{ steps.ec2-state.outputs.STATE == 'running' }}
-        id: instance-status-check
-        run: |
-          INSTANCE_ID="${{ inputs.InstanceId }}"
-          REGION="${{ inputs.Region }}"
-          METRICS=(StatusCheckFailed_System StatusCheckFailed_Instance StatusCheckFailed StatusCheckFailed_AttachedEBS)
-          unhealthy=0
-
-          for METRIC in "${METRICS[@]}"; do
-            VALUE=$(aws cloudwatch get-metric-statistics \
-              --namespace AWS/EC2 --metric-name "$METRIC" \
-              --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-              --start-time $(date -u -d '-5 minutes' +%Y-%m-%dT%H:%M:%SZ) \
-              --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
-              --period 60 --statistics Maximum \
-              --region $REGION \
-              --query 'Datapoints[0].Maximum' --output text)
-
-            if [[ "$VALUE" != "None" && "$VALUE" != "0.0" ]]; then
-              echo "⚠️ $METRIC failed: $VALUE"
-              unhealthy=1
-            else
-              echo "✅ $METRIC passed: $VALUE"
-            fi
-          done
-
-          echo "UNHEALTHY=$unhealthy" >> $GITHUB_OUTPUT
-
-      - name: Reboot instance if unhealthy
-        if: ${{ steps.instance-status-check.outputs.UNHEALTHY == '1' && steps.ec2-state.outputs.STATE == 'running' }}
-        run: |
-          echo "Instance is unhealthy. Rebooting..."
-          aws ec2 stop-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
-          
-          echo "Waiting for instance to stop..."
-          attempts=0
-          max_attempts=200
-          delay=15
-          
-          while [ $attempts -lt $max_attempts ]; do
-            state=$(aws ec2 describe-instances --region ${{ inputs.Region }} \
-              --instance-ids ${{ inputs.InstanceId }} \
-              --query "Reservations[0].Instances[0].State.Name" --output text)
-          
-            echo "Attempt $((attempts+1)): Instance state is '$state'"
-          
-            if [ "$state" = "stopped" ]; then
-              echo "Instance successfully stopped."
-              break
-            fi
-          
-            if [ "$state" = "terminated" ]; then
-              echo "Instance is terminated. Exiting..."
-              exit 1
-            fi
-          
-            attempts=$((attempts + 1))
-            sleep $delay
-          done
-          
-          if [ $attempts -ge $max_attempts ]; then
-            echo "Instance did not stop within expected time. Exiting..."
-            exit 1
-          fi
-          
-          aws ec2 start-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
-
-      - name: Get SSM Document Name
-        if: ${{ steps.ec2-state.outputs.STATE == 'running' }}
-        id: get-doc
-        run: |
-          documents=$(aws ssm list-documents --region ${{ inputs.REGION }} --filters Key=Owner,Values=Self --query "DocumentIdentifiers[*].Name" --output json)
-          document_name=$(echo "$documents" | jq -r '.[] | select(contains("SsmDocument-RemediationActionSsmDocument"))')  
-          echo "Using SSM Document: $document_name"
-          echo "DOC_NAME=$document_name" >> "$GITHUB_OUTPUT"
-
-      - name: Run SSM Command
-        if: ${{ steps.ec2-state.outputs.STATE == 'running' }}
-        id: send-command
-        run: |
-          cmd_id=$(aws ssm send-command \
-            --document-name "${{ steps.get-doc.outputs.DOC_NAME }}" \
-            --instance-ids ${{ inputs.InstanceId }} \
-            --region ${{ inputs.Region }} \
-            --parameters AlertName="${{ inputs.CheckName }}" \
-            --query 'Command.CommandId' --output text)
-          
-          echo "SSM Command ID: $cmd_id"
-          echo "SSM Run Command Link- https://${{ inputs.REGION }}.console.aws.amazon.com/systems-manager/run-command/$cmd_id?region=${{ inputs.REGION }}"
-          echo "CMD_ID=$cmd_id" >> "$GITHUB_OUTPUT"
-
-      - name: Wait and Get Run Command Status
-        if: ${{ steps.ec2-state.outputs.STATE == 'running' }}
-        id: check_status
-        run: |
-          echo "Waiting 15 seconds before checking command status..."
-          sleep 15
-
-          OUTPUT=$(aws ssm get-command-invocation \
-            --command-id ${{ steps.send-command.outputs.cmd_id }} \
-            --instance-id ${{ inputs.InstanceId }} \
-            --output json)
-          
-          STATUS=$(echo "$OUTPUT" | jq -r '.Status')
-          STDOUT=$(echo "$OUTPUT" | jq -r '.StandardOutputContent')
-          STDERR=$(echo "$OUTPUT" | jq -r '.StandardErrorContent')
-
-          echo "SSM Command Status: $STATUS"
-          echo "::group::SSM Command Output"
-          echo "$STDOUT"
-          echo "::endgroup::"
-          
-          echo "::group::SSM Command Errors (if any)"
-          echo "$STDERR"
-          echo "::endgroup::"
-
-          echo "SSM Command Status: $STATUS"
-          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
-
-      - name: Reboot Instance If SSM Fails
-        if: ${{ steps.check_status.outputs.status != 'Success' && steps.ec2-state.outputs.STATE == 'running' }}
-        run: |
-          echo "SSM command did not succeed. Rebooting instance..."
-          aws ec2 stop-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
-          
-          echo "Waiting for instance to stop..."
-          attempts=0
-          max_attempts=200
-          delay=15
-          
-          while [ $attempts -lt $max_attempts ]; do
-            state=$(aws ec2 describe-instances --region ${{ inputs.Region }} \
-              --instance-ids ${{ inputs.InstanceId }} \
-              --query "Reservations[0].Instances[0].State.Name" --output text)
-          
-            echo "Attempt $((attempts+1)): Instance state is '$state'"
-          
-            if [ "$state" = "stopped" ]; then
-              echo "Instance successfully stopped."
-              break
-            fi
-          
-            if [ "$state" = "terminated" ]; then
-              echo "Instance is terminated. Exiting..."
-              exit 1
-            fi
-          
-            attempts=$((attempts + 1))
-            sleep $delay
-          done
-          
-          if [ $attempts -ge $max_attempts ]; then
-            echo "Instance did not stop within expected time. Exiting..."
-            exit 1
-          fi
-          
-          aws ec2 start-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
+          echo "Received JSON input:"
+          echo "${{ inputs.Event }}"
+  
+          # Parse JSON and print each value (example)
+          echo "Parsing JSON:"
+          echo "${{ inputs.Event }}" | jq .
