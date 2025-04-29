@@ -122,10 +122,10 @@ jobs:
         id: send-command
         run: |
           cmd_id=$(aws ssm send-command \
-            --document-name "${{ steps.get-doc.outputs.DOC_NAME }}" \
+            --document-name "AWS-RunShellScript" \
             --instance-ids ${{ inputs.InstanceId }} \
             --region ${{ inputs.Region }} \
-            --parameters AlertName="${{ inputs.CheckName }}" \
+            --parameters 'commands=["date"]' \ \
             --query 'Command.CommandId' --output text)
           
           echo "SSM Command ID: $cmd_id"
