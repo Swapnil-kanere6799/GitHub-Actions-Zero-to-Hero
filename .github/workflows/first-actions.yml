@@ -92,9 +92,12 @@ jobs:
 
           # Generate host IPs
           HOSTS=()
-          for ((i=0; i<${hostCount}; i++)); do
-            HOST="${BASE_IP}.$((LAST_OCTET + i))"
-            HOSTS+=("\"$HOST\"")
+          for ((i=0; i<$hostCount; i++)); do
+            IP="${BASE_IP}.$((LAST_OCTET + i))"
+            if [ -n "$port" ]; then
+              IP="${IP}:${port}"
+            fi
+            HOSTS+=("\"$IP\"")
           done
 
           HOSTS_ARRAY=$(IFS=, ; echo "${HOSTS[*]}")
