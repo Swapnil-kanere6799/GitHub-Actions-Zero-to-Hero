@@ -1,28 +1,123 @@
-name: My First GitHub Actions
+name: mongo/Add-Document-To-Mongo-Collection
 
-on: [push]
+run-name: mongo/Add-Document-To-Mongo-Collection-${{ inputs.Collections }}-${{ github.run_number }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      Databases:
+        type: choice
+        description: List of Databases
+        required: true
+        options:
+          - common
+
+      Collections:
+        type: choice
+        description: List of Collections
+        required: true
+        options:
+          - accounts
+          - accounts_meta
+          - catalog_store_config
+          - deduplicator_config
+          - eventstore_config
+          - redis_config
+
+      Operations:
+        type: choice
+        description: List of Operations
+        required: true
+        options:
+          - insert
+
+      StackName:
+        type: string
+        description: StackName
+        required: true
+
+      StartIp:
+        type: string
+        description: Start IP of cluster
+        required: true
+
+      NumberOfHost:
+        type: string
+        description: Number Of Host
+        required: true
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
 
 jobs:
-  build:
-    runs-on: self-hosted
-
-    strategy:
-      matrix:
-        python-version: [3.8, 3.9]
-
+  setup-job-environment:
+    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
-    - name: Set up Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: ${{ matrix.python-version }}
+      - name: Get stack prefix
+        id: get-stack-prefix
+        run: |
+          set -euxo pipefail
+          stack_prefix=$(echo "${{ inputs.StackName }}" | cut -d '-' -f1)
+          echo "STACK_PREFIX=${stack_prefix}" >> $GITHUB_OUTPUT
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pytest
 
-    - name: Run tests
-      run: |
-        cd src
-        python -m pytest addition.py
+      - name: Generate Mongo Insert Query with the help of given inputs
+        id: generate-query
+        run: |
+          set -euxo pipefail
+          startIp=${{ inputs.StartIp }}
+          hostCount=${{ inputs.NumberOfHost }}
+          collection=${{ inputs.Collections }}
+          stackName=${{ inputs.StackName }}
+          operation=${{ inputs.Operations }}
+          
+          
+          # Set port based on collection
+          case "$collection" in
+            deduplicator_config|redis_config)
+              port="6379"
+              ;;
+            eventstore_config)
+              port="8080"
+              stackName="${stackName//-/_}"
+              ;;
+            *)
+              port=""
+              ;;
+          esac
+
+          # Extract base IP (removing last octet)
+          BASE_IP=$(echo "$startIp" | awk -F. '{print $1"."$2"."$3}')
+          LAST_OCTET=$(echo "$startIp" | awk -F. '{print $4}')
+
+          # Generate host IPs
+          HOSTS=()
+          for ((i=0; i<${hostCount}; i++)); do
+            HOST="${BASE_IP}.$((LAST_OCTET + i))"
+            HOSTS+=("\"$HOST\"")
+          done
+
+          HOSTS_ARRAY=$(IFS=, ; echo "${HOSTS[*]}")
+
+          # Create the full insert query
+          INSERT_QUERY="db.${collection}.${operation}({
+            \"_id\": \"c_${stackName}\",
+            \"hosts\": [ ${HOSTS_ARRAY} ]
+          })"
+          
+          # Print it for visibility
+          echo ""
+          echo "=================== Mongo Insert Query ==================="
+          echo "${INSERT_QUERY}"
+          echo "=========================================================="
+          
+          # Store as GitHub Action output
+          echo "MONGO_QUERY<<EOF" >> $GITHUB_OUTPUT
+          echo "${INSERT_QUERY}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "CLUSTER_ID=$stackName" >> $GITHUB_OUTPUT
+
+    outputs:
+      STACK_PREFIX: ${{ steps.get-stack-prefix.outputs.STACK_PREFIX }}
+      MONGO_QUERY: ${{ steps.generate-query.outputs.MONGO_QUERY }}
+      CLUSTER_ID: ${{ steps.generate-query.outputs.CLUSTER_ID }}
