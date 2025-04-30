@@ -99,8 +99,9 @@ jobs:
             fi
             HOSTS+=("\"$IP\"")
           done
+          
+          HOSTS_ARRAY=$(printf "\"%s\",\n" "${HOSTS[@]}" | sed '$ s/,$//')
 
-          HOSTS_ARRAY=$(IFS=, ; echo "${HOSTS[*]}")
 
           # Create the full insert query
           INSERT_QUERY="db.${collection}.${operation}({
