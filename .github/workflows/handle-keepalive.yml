@@ -226,7 +226,7 @@ jobs:
           fi
           
       - name: Starting instance
-        if: ${{ steps.check_status.outputs.status != 'Pending' }}
+        if: ${{ steps.check_status.outputs.status == 'Pending' }}
         run: |
           echo "Instance is Stopped. Starting instance..."                
           aws ec2 start-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
