@@ -42,7 +42,7 @@ jobs:
         if: ${{ steps.ec2-state.outputs.STATE == 'running' }}
         id: ec2-instance-tag
         run: |
-          component=$(aws ec2 describe-tags --instance-ids ${{ inputs.InstanceId }} --filters "Name=resource-id,Values=${{ inputs.Region }}" "Name=key,Values=role" --region ${{ inputs.Region }} --query "Tags[0].Value" --output text)
+          component=$(aws ec2 describe-tags --filters "Name=resource-id,Values=${{ inputs.InstanceId }}" "Name=key,Values=role" --region ${{ inputs.Region }} --query "Tags[0].Value" --output text)
           if [ -z "$component" ] || [ "$component" == "None" ]; then
             echo "No tag key 'role' is found"
           else
