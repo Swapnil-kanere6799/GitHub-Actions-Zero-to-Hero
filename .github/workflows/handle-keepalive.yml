@@ -189,7 +189,7 @@ jobs:
           echo "status=$STATUS" >> "$GITHUB_OUTPUT"
 
       - name: Stopping Instance If SSM stuck in pending state
-        if: ${{ steps.check_status.outputs.status != 'Pending' }}
+        if: ${{ steps.check_status.outputs.status == 'Pending' }}
         run: |
           echo "SSM command did not succeed. Rebooting instance..."
           aws ec2 stop-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
