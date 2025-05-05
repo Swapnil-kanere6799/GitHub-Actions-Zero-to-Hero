@@ -1,8 +1,6 @@
-
-
 name: remediation/Remediation-Keepalive
 
-run-name: remediation/Remediation-Keepalive-${{ inputs.InstanceId }}-${{ github.run_number }}
+run-name: remediation/Remediation-Keepalive-${{ inputs.Region }}-${{ inputs.InstanceId }}-${{ github.run_number }}
 
 on:
   workflow_dispatch:
@@ -18,31 +16,57 @@ on:
         required: true
 
 jobs:
-  remediation-keepalive:
+  setup-job-environment:
     runs-on: ubuntu-latest
+    concurrency:
+      group: keepalive-${{ inputs.InstanceId }}
+      cancel-in-progress: false
     steps:
-      - name: Checkout Infra-Actions repo
-        uses: actions/checkout@v3
-
       - name: Set Up AWS Credentials
         uses: aws-actions/configure-aws-credentials@v3
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-south-1
+          aws-region: ${{ inputs.Region }}
 
-      - name: Check EC2 instance state
+      - name: Check EC2 instance state, if running then runs SOP
         id: ec2-state
         run: |
-          state=$(aws ec2 describe-instances --instance-ids ${{ inputs.InstanceId }} \
-            --query 'Reservations[0].Instances[0].State.Name' --output text)
+          state=$(aws ec2 describe-instances --instance-ids ${{ inputs.InstanceId }} --query 'Reservations[0].Instances[0].State.Name' --output text)
           if [ "$state" != "running" ]; then
             echo "Instance is not in running state. Current Instance status: $state"
           fi
           echo "STATE=$state" >> $GITHUB_OUTPUT
 
-      - name: Check CloudWatch metrics
+      - name: Fetch component from ec2 instance tag 'role'
         if: ${{ steps.ec2-state.outputs.STATE == 'running' }}
+        id: ec2-instance-tag
+        run: |
+          component=$(aws ec2 describe-tags --instance-ids ${{ inputs.InstanceId }} --filters "Name=resource-id,Values=${{ inputs.Region }}" "Name=key,Values=role" --region ${{ inputs.Region }} --query "Tags[0].Value" --output text)
+          if [ -z "$component" ] || [ "$component" == "None" ]; then
+            echo "No tag key 'role' is found"
+          else
+            echo "Role tag value: $component"
+          fi
+          echo "COMPONENT=$component" >> $GITHUB_OUTPUT
+
+    outputs:
+      INSTANCE_STATE: ${{ steps.ec2-state.outputs.STATE }}
+      COMPONENT: ${{ steps.ec2-instance-tag.outputs.COMPONENT }}
+
+  check-health-of-instance-and-restart:
+    if: ${{ needs.setup-job-environment.outputs.COMPONENT == 'eventstore' || needs.setup-job-environment.outputs.INSTANCE_STATE == 'running' }}
+    runs-on: ubuntu-latest
+    needs: setup-job-environment
+    steps:
+      - name: Set Up AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.Region }}
+
+      - name: Check CloudWatch metrics
         id: instance-status-check
         run: |
           INSTANCE_ID="${{ inputs.InstanceId }}"
@@ -70,10 +94,10 @@ jobs:
 
           echo "UNHEALTHY=$unhealthy" >> $GITHUB_OUTPUT
 
-      - name: Reboot instance if unhealthy
-        if: ${{ steps.instance-status-check.outputs.UNHEALTHY == '1' && steps.ec2-state.outputs.STATE == 'running' }}
+      - name: Stopping instance if unhealthy
+        if: ${{ steps.instance-status-check.outputs.UNHEALTHY == '1' }}
         run: |
-          echo "Instance is unhealthy. Rebooting..."
+          echo "Instance is unhealthy. Stopping..."
           aws ec2 stop-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
           
           echo "Waiting for instance to stop..."
@@ -107,33 +131,37 @@ jobs:
             exit 1
           fi
           
+      - name: Starting instance
+        if: ${{ steps.instance-status-check.outputs.UNHEALTHY == '1' }}
+        run: |
+          echo "Instance is Stopped. Starting instance..."                
           aws ec2 start-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
+          sleep 20
 
       - name: Get SSM Document Name
-        if: ${{ steps.ec2-state.outputs.STATE == 'running' }}
-        id: get-doc
+        id: get-ssm-doc
         run: |
-          document_name="AWS-RunShellScript"
+          document_name="AWS-RunShellScript" 
           echo "Using SSM Document: $document_name"
           echo "DOC_NAME=$document_name" >> "$GITHUB_OUTPUT"
 
-      - name: Run SSM Command
-        if: ${{ steps.ec2-state.outputs.STATE == 'running' }}
+      - name: Run SSM Command to check ssm-agent health
         id: send-command
         run: |
           cmd_id=$(aws ssm send-command \
+            --instance-ids "${{ inputs.InstanceId }}" \
+            --region "${{ inputs.Region }}" \
             --document-name "AWS-RunShellScript" \
-            --instance-ids ${{ inputs.InstanceId }} \
-            --region ${{ inputs.Region }} \
-            --parameters 'commands=["date"]' \ \
-            --query 'Command.CommandId' --output text)
+            --comment "Running date command" \
+            --parameters commands="date" \
+            --query "Command.CommandId" \
+            --output text)
           
           echo "SSM Command ID: $cmd_id"
           echo "SSM Run Command Link- https://${{ inputs.REGION }}.console.aws.amazon.com/systems-manager/run-command/$cmd_id?region=${{ inputs.REGION }}"
           echo "CMD_ID=$cmd_id" >> "$GITHUB_OUTPUT"
 
       - name: Wait and Get Run Command Status
-        if: ${{ steps.ec2-state.outputs.STATE == 'running' }}
         id: check_status
         run: |
           echo "Waiting 15 seconds before checking command status..."
@@ -160,8 +188,8 @@ jobs:
           echo "SSM Command Status: $STATUS"
           echo "status=$STATUS" >> "$GITHUB_OUTPUT"
 
-      - name: Reboot Instance If SSM Fails
-        if: ${{ steps.check_status.outputs.status != 'Success' && steps.ec2-state.outputs.STATE == 'running' }}
+      - name: Stopping Instance If SSM stuck in pending state
+        if: ${{ steps.check_status.outputs.status != 'Pending' }}
         run: |
           echo "SSM command did not succeed. Rebooting instance..."
           aws ec2 stop-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
@@ -197,4 +225,9 @@ jobs:
             exit 1
           fi
           
+      - name: Starting instance
+        if: ${{ steps.check_status.outputs.status != 'Pending' }}
+        run: |
+          echo "Instance is Stopped. Starting instance..."                
           aws ec2 start-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
+          sleep 20
