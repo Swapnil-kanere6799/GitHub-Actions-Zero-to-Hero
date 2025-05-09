@@ -16,11 +16,12 @@ on:
         required: true
 
 jobs:
-  setup-job-environment:
+  execute-keepalive-remediation:
     runs-on: ubuntu-latest
     concurrency:
       group: keepalive-${{ inputs.InstanceId }}
       cancel-in-progress: false
+    needs: setup-job-environment
     steps:
       - name: Set Up AWS Credentials
         uses: aws-actions/configure-aws-credentials@v3
@@ -35,38 +36,13 @@ jobs:
           state=$(aws ec2 describe-instances --instance-ids ${{ inputs.InstanceId }} --query 'Reservations[0].Instances[0].State.Name' --output text)
           if [ "$state" != "running" ]; then
             echo "Instance is not in running state. Current Instance status: $state"
-          fi
-          echo "STATE=$state" >> $GITHUB_OUTPUT
-
-      - name: Fetch component from ec2 instance tag 'role'
-        if: ${{ steps.ec2-state.outputs.STATE == 'running' }}
-        id: ec2-instance-tag
-        run: |
-          component=$(aws ec2 describe-tags --filters "Name=resource-id,Values=${{ inputs.InstanceId }}" "Name=key,Values=role" --region ${{ inputs.Region }} --query "Tags[0].Value" --output text)
-          if [ -z "$component" ] || [ "$component" == "None" ]; then
-            echo "No tag key 'role' is found"
           else
-            echo "Role tag value: $component"
+            echo "Current Instance status: $state"
           fi
-          echo "COMPONENT=$component" >> $GITHUB_OUTPUT
-
-    outputs:
-      INSTANCE_STATE: ${{ steps.ec2-state.outputs.STATE }}
-      COMPONENT: ${{ steps.ec2-instance-tag.outputs.COMPONENT }}
-
-  check-health-of-instance-and-restart:
-    if: ${{ needs.setup-job-environment.outputs.COMPONENT == 'eventstore' || needs.setup-job-environment.outputs.INSTANCE_STATE == 'running' }}
-    runs-on: ubuntu-latest
-    needs: setup-job-environment
-    steps:
-      - name: Set Up AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v3
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ inputs.Region }}
+          echo "STATE=$state" >> $GITHUB_OUTPUT          
 
       - name: Check CloudWatch metrics
+        if: ${{ steps.ec2-state.outputs.STATE == 'running' }}
         id: instance-status-check
         run: |
           INSTANCE_ID="${{ inputs.InstanceId }}"
@@ -95,7 +71,7 @@ jobs:
           echo "UNHEALTHY=$unhealthy" >> $GITHUB_OUTPUT
 
       - name: Stopping instance if unhealthy
-        if: ${{ steps.instance-status-check.outputs.UNHEALTHY == '1' }}
+        if: ${{ steps.instance-status-check.outputs.UNHEALTHY == '1' || steps.ec2-state.outputs.STATE == 'running' }}
         run: |
           echo "Instance is unhealthy. Stopping..."
           aws ec2 stop-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
@@ -132,36 +108,38 @@ jobs:
           fi
           
       - name: Starting instance
-        if: ${{ steps.instance-status-check.outputs.UNHEALTHY == '1' }}
+        if: ${{ steps.instance-status-check.outputs.UNHEALTHY == '1' || steps.ec2-state.outputs.STATE == 'running' }}
         run: |
           echo "Instance is Stopped. Starting instance..."                
           aws ec2 start-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
           sleep 20
 
       - name: Get SSM Document Name
+        if: ${{ steps.instance-status-check.outputs.UNHEALTHY != '1' || steps.ec2-state.outputs.STATE == 'running' }}
         id: get-ssm-doc
         run: |
-          document_name="AWS-RunShellScript" 
+          documents=$(aws ssm list-documents --region ${{ inputs.REGION }} --filters Key=Owner,Values=Self --query "DocumentIdentifiers[*].Name" --output json)
+          document_name=$(echo "$documents" | jq -r '.[] | select(contains("SsmDocument-RemediationActionSsmDocument"))')  
           echo "Using SSM Document: $document_name"
           echo "DOC_NAME=$document_name" >> "$GITHUB_OUTPUT"
 
       - name: Run SSM Command to check ssm-agent health
+        if: ${{ steps.instance-status-check.outputs.UNHEALTHY != '1' || steps.ec2-state.outputs.STATE == 'running' }}
         id: send-command
         run: |
           cmd_id=$(aws ssm send-command \
-            --instance-ids "${{ inputs.InstanceId }}" \
-            --region "${{ inputs.Region }}" \
-            --document-name "AWS-RunShellScript" \
-            --comment "Running date command" \
-            --parameters commands="date" \
-            --query "Command.CommandId" \
-            --output text)
+            --document-name "${{ steps.get-ssm-doc.outputs.DOC_NAME }}" \
+            --instance-ids ${{ inputs.InstanceId }} \
+            --region ${{ inputs.Region }} \
+            --parameters AlertName="keepalive" \
+            --query 'Command.CommandId' --output text)
           
           echo "SSM Command ID: $cmd_id"
           echo "SSM Run Command Link- https://${{ inputs.REGION }}.console.aws.amazon.com/systems-manager/run-command/$cmd_id?region=${{ inputs.REGION }}"
           echo "CMD_ID=$cmd_id" >> "$GITHUB_OUTPUT"
 
       - name: Wait and Get Run Command Status
+        if: ${{ steps.instance-status-check.outputs.UNHEALTHY != '1' || steps.ec2-state.outputs.STATE == 'running' }}
         id: check_status
         run: |
           echo "Waiting 15 seconds before checking command status..."
@@ -189,7 +167,7 @@ jobs:
           echo "status=$STATUS" >> "$GITHUB_OUTPUT"
 
       - name: Stopping Instance If SSM stuck in pending state
-        if: ${{ steps.check_status.outputs.status == 'Pending' }}
+        if: ${{ steps.check_status.outputs.status == 'Pending' && steps.instance-status-check.outputs.UNHEALTHY != '1' || steps.ec2-state.outputs.STATE == 'running' }}
         run: |
           echo "SSM command did not succeed. Rebooting instance..."
           aws ec2 stop-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
@@ -226,8 +204,42 @@ jobs:
           fi
           
       - name: Starting instance
-        if: ${{ steps.check_status.outputs.status == 'Pending' }}
+        if: ${{ steps.check_status.outputs.status == 'Pending' && steps.instance-status-check.outputs.UNHEALTHY != '1' || steps.ec2-state.outputs.STATE == 'running' }}
         run: |
           echo "Instance is Stopped. Starting instance..."                
           aws ec2 start-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
-          sleep 20
+          sleep 45
+
+      - name: Post verify instance health
+        run: |
+          cmd_id=$(aws ssm send-command \
+            --document-name "${{ steps.get-ssm-doc.outputs.DOC_NAME }}" \
+            --instance-ids ${{ inputs.InstanceId }} \
+            --region ${{ inputs.Region }} \
+            --parameters AlertName="keepalive" \
+            --query 'Command.CommandId' --output text)
+          
+          echo "SSM Command ID: $cmd_id"
+          echo "SSM Run Command Link- https://${{ inputs.REGION }}.console.aws.amazon.com/systems-manager/run-command/$cmd_id?region=${{ inputs.REGION }}"
+          sleep 15  
+          OUTPUT=$(aws ssm get-command-invocation \
+            --command-id $cmd_id \
+            --instance-id ${{ inputs.InstanceId }} \
+            --output json)
+          STATUS=$(echo "$OUTPUT" | jq -r '.Status')
+          echo "SSM Command Status: $STATUS"
+          if [[ "$STATUS" == "Pending" ]]; then
+            echo "❌ SSM command stuck in $STATUS state for too long. Assuming instance is still responding slow."
+            exit 1
+          else
+            echo "Instance is up & running."
+
+  notify-on-failure:
+    if: failure()
+    runs-on: ubuntu-latest
+    needs: execute-keepalive-remediation
+    steps:
+      - name: Send Slack notification on failure
+        run: |
+          set -euxo pipefail
+          curl -X POST -H "Authorization: Bearer xoxb-2601822751-6777186400710-fBZBEN2Ma97f93dkdcjswlaN" -H "Content-Type: application/json" --data '{"text":":x: *Keepalive Remediation Workflow Failed*","attachments":[{"color":"danger","title":"GitHub Workflow Failed","title_link":"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}","text":"Check the workflow run for more details.","footer":"GitHub Actions","ts":"'$(date +%s)'"}]}' https://slack.com/api/chat.postMessage
