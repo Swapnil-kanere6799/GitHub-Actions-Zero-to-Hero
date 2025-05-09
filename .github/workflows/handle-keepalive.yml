@@ -21,7 +21,6 @@ jobs:
     concurrency:
       group: keepalive-${{ inputs.InstanceId }}
       cancel-in-progress: false
-    needs: setup-job-environment
     steps:
       - name: Set Up AWS Credentials
         uses: aws-actions/configure-aws-credentials@v3
