@@ -70,7 +70,7 @@ jobs:
           echo "UNHEALTHY=$unhealthy" >> $GITHUB_OUTPUT
 
       - name: Stopping instance if unhealthy
-        if: ${{ steps.instance-status-check.outputs.UNHEALTHY == '1' || steps.ec2-state.outputs.STATE == 'running' }}
+        if: ${{ steps.instance-status-check.outputs.UNHEALTHY == '1' && steps.ec2-state.outputs.STATE == 'running' }}
         run: |
           echo "Instance is unhealthy. Stopping..."
           aws ec2 stop-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
@@ -107,14 +107,14 @@ jobs:
           fi
           
       - name: Starting instance
-        if: ${{ steps.instance-status-check.outputs.UNHEALTHY == '1' || steps.ec2-state.outputs.STATE == 'running' }}
+        if: ${{ steps.instance-status-check.outputs.UNHEALTHY == '1' && steps.ec2-state.outputs.STATE == 'running' }}
         run: |
           echo "Instance is Stopped. Starting instance..."                
           aws ec2 start-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
           sleep 20
 
       - name: Get SSM Document Name
-        if: ${{ steps.instance-status-check.outputs.UNHEALTHY != '1' || steps.ec2-state.outputs.STATE == 'running' }}
+        if: ${{ steps.instance-status-check.outputs.UNHEALTHY != '1' && steps.ec2-state.outputs.STATE == 'running' }}
         id: get-ssm-doc
         run: |
           documents=$(aws ssm list-documents --region ${{ inputs.REGION }} --filters Key=Owner,Values=Self --query "DocumentIdentifiers[*].Name" --output json)
@@ -123,7 +123,7 @@ jobs:
           echo "DOC_NAME=$document_name" >> "$GITHUB_OUTPUT"
 
       - name: Run SSM Command to check ssm-agent health
-        if: ${{ steps.instance-status-check.outputs.UNHEALTHY != '1' || steps.ec2-state.outputs.STATE == 'running' }}
+        if: ${{ steps.instance-status-check.outputs.UNHEALTHY != '1' && steps.ec2-state.outputs.STATE == 'running' }}
         id: send-command
         run: |
           cmd_id=$(aws ssm send-command \
@@ -138,7 +138,7 @@ jobs:
           echo "CMD_ID=$cmd_id" >> "$GITHUB_OUTPUT"
 
       - name: Wait and Get Run Command Status
-        if: ${{ steps.instance-status-check.outputs.UNHEALTHY != '1' || steps.ec2-state.outputs.STATE == 'running' }}
+        if: ${{ steps.instance-status-check.outputs.UNHEALTHY != '1' && steps.ec2-state.outputs.STATE == 'running' }}
         id: check_status
         run: |
           echo "Waiting 15 seconds before checking command status..."
@@ -166,7 +166,7 @@ jobs:
           echo "status=$STATUS" >> "$GITHUB_OUTPUT"
 
       - name: Stopping Instance If SSM stuck in pending state
-        if: ${{ steps.check_status.outputs.status == 'Pending' && steps.instance-status-check.outputs.UNHEALTHY != '1' || steps.ec2-state.outputs.STATE == 'running' }}
+        if: ${{ steps.check_status.outputs.status == 'Pending' && steps.instance-status-check.outputs.UNHEALTHY != '1' && steps.ec2-state.outputs.STATE == 'running' }}
         run: |
           echo "SSM command did not succeed. Rebooting instance..."
           aws ec2 stop-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
@@ -203,13 +203,14 @@ jobs:
           fi
           
       - name: Starting instance
-        if: ${{ steps.check_status.outputs.status == 'Pending' && steps.instance-status-check.outputs.UNHEALTHY != '1' || steps.ec2-state.outputs.STATE == 'running' }}
+        if: ${{ steps.check_status.outputs.status == 'Pending' && steps.instance-status-check.outputs.UNHEALTHY != '1' && steps.ec2-state.outputs.STATE == 'running' }}
         run: |
           echo "Instance is Stopped. Starting instance..."                
           aws ec2 start-instances --region ${{ inputs.Region }} --instance-ids ${{ inputs.InstanceId }}
           sleep 45
 
       - name: Post verify instance health
+        if: ${{ steps.ec2-state.outputs.STATE == 'running' }}
         run: |
           cmd_id=$(aws ssm send-command \
             --document-name "${{ steps.get-ssm-doc.outputs.DOC_NAME }}" \
