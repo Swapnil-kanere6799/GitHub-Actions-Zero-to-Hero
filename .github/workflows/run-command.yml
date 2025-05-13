@@ -114,18 +114,4 @@ jobs:
             echo "SSM command ended with status: $STATUS. Exiting with failure."
             exit 1
           fi
-
-  notify-on-failure:
-    if: failure()
-    runs-on: ubuntu-latest
-    needs: execute-run-command-remediation
-    steps:
-      - name: Send Slack notification on failure
-        run: |
-          set -euxo pipefail
-          echo "Sent notification on slack"
-          curl -X POST -H "Authorization: Bearer xoxb-2601822751-6777186400710-fBZBEN2Ma97f93dkdcjswlaN" -H "Content-Type: application/json" --data '{"text":":x: *Keepalive Remediation Workflow Failed*","attachments":[{"color":"danger","title":"Remediation Workflow Failed of ${{ inputs.AlertName }} for ${{ inputs.StackName }}:${{ inputs.InstanceId }}":"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}","text":"Check the workflow run for more details.","footer":"GitHub Actions","ts":"'$(date +%s)'"}]}' https://slack.com/api/chat.postMessage
-          echo "Sent notification on pagerduty"
-          curl -X POST -H "Content-Type: application/json" -H "Authorization: Token token=u+FedzuEPfUCz68AK3NA" https://events.pagerduty.com/v2/enqueue -d '{"event_action":"trigger","routing_key":"b49d8f2ce0e04205d0ded303ec9f9de2","payload":{"summary": Remediation Workflow Failed of ${{ inputs.AlertName }} for ${{ inputs.StackName }}:${{ inputs.InstanceId }}","source":"'"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"'","severity":"error"}}'          
-
                 
