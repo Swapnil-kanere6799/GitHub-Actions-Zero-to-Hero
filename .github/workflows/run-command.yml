@@ -152,7 +152,7 @@ jobs:
           aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       - name: Run xfs_growfs command via SSM on mongo instances
-        if: ${{ inputs.Component == mongo }}
+        if: ${{ inputs.Component == 'mongo' }}
         run: |
           command_id=$(aws ssm send-command \
               --region ${{ needs.setup-job-environment.outputs.REGION }} \
@@ -172,7 +172,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       - name: Execute resize2fs on eventstore instances in stack via single SSM command
-        if: ${{ steps.fetch-query-to-update-volume.output.COMPONENT == eventstore }}
+        if: ${{ steps.fetch-query-to-update-volume.output.COMPONENT == 'eventstore' }}
         run: |
           echo "Executing resize2fs on all instances in stack: $STACK_NAME in region: $REGION"
           
