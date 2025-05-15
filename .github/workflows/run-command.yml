@@ -1,117 +1,198 @@
-name: remediation/Remediation-Run-Command
+name: disk/Upgrade-Disk-Size
 
-run-name: remediation/Remediation-Run-Command-${{ inputs.AlertName }}-${{ inputs.InstanceId }}-${{ github.run_number }}
+run-name: mongo/Upgrade-Mongo-Volume-Size-${{ inputs.StackName }}-${{ github.run_number }}
 
 on:
   workflow_dispatch:
     inputs:
-      InstanceId:
-        type: string
-        description: Instance ID
+      Component:
+        type: choice
         required: true
+        description: Component
+        options:
+          - mongo
+          - eventstore
+          - nb
+          - inboxstore
+          - lc-cache-writer
+          - logprocessor
+          - catalogstore
 
       StackName:
         type: string
+        required: true
         description: Stack Name
-        required: true
 
-      AlertName:
+      IssueId:
         type: string
-        description: Alert Name
         required: true
+        description: Issue ID for this task
+
+      VolumeSize:
+        type: number
+        default: 0
+        description: Upgraded Volume Size
 
 jobs:
-  execute-run-command-remediation:
+  setup-job-environment:
     runs-on: ubuntu-latest
-    concurrency:
-      group: run-command-${{ inputs.StackName }}
-      cancel-in-progress: false
     steps:
+      - name: Generate github token
+        id: generate-github-token
+        uses: tibdex/github-app-token@v1.8.0
+        with:
+          app_id: ${{ secrets.CLEVERTAP_SNE_BOT_ID }}
+          private_key: ${{ secrets.CLEVERTAP_SNE_BOT_PRIVATE_ACCESS_KEY }}
+
       - name: Checkout Infra-Actions repo
-        id: checkout-infra-actions-repo
         uses: actions/checkout@v3
+
+      - name: Checkout Cloudformation repo
+        uses: actions/checkout@v3
+        with:
+          repository: CleverTap-SNE/Cloudformation
+          path: cloudformation
+          token: ${{ steps.generate-github-token.outputs.token }}
 
       - name: Get stack prefix
         id: get-stack-prefix
         run: |
           set -euxo pipefail
           stack_prefix=$(echo "${{ inputs.StackName }}" | cut -d '-' -f1)
-          echo "STACK_PREFIX=$stack_prefix" >> $GITHUB_OUTPUT
+          echo "STACK_PREFIX=${stack_prefix}" >> $GITHUB_OUTPUT
 
       - name: Get stack region
         id: get-stack-region
         run: |
           set -euxo pipefail
           region=$(./scripts/utils/get_stack_region.bash ${{ steps.get-stack-prefix.outputs.STACK_PREFIX }})
-          echo "REGION=${region}" >> $GITHUB_OUTPUT   
+          echo "REGION=${region}" >> $GITHUB_OUTPUT
 
-      - name: Set Up AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v3
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ steps.get-stack-region.outputs.REGION }}
-
-      - name: Get SSM Document Name
-        id: get-ssm-doc
+      - name: Get Current Volume Size
+        id: get-volume-size
+        working-directory: cloudformation
         run: |
-          documents=$(aws ssm list-documents --region ${{ steps.get-stack-region.outputs.REGION }} --filters Key=Owner,Values=Self --query "DocumentIdentifiers[*].Name" --output json)
-          document_name=$(echo "$documents" | jq -r '.[] | select(contains("SsmDocument-RemediationActionSsmDocument"))')  
-          echo "Using SSM Document: $document_name"
-          echo "DOC_NAME=$document_name" >> "$GITHUB_OUTPUT"
-
-      - name: Run SSM Run Command for ${{ inputs.AlertName }}
-        id: send-command
-        run: |
-          cmd_id=$(aws ssm send-command \
-            --document-name "${{ steps.get-ssm-doc.outputs.DOC_NAME }}" \
-            --instance-ids ${{ inputs.InstanceId }} \
-            --region ${{ steps.get-stack-region.outputs.REGION }} \
-            --parameters AlertName=${{ inputs.AlertName }} \
-            --query 'Command.CommandId' --output text)
+          set -euxo pipefail
+          stack_prefix=${{ steps.get-stack-prefix.outputs.STACK_PREFIX }}
+          component=${{ inputs.Component }}
+          stack_name=${{ inputs.StackName }}
           
-          echo "SSM Command ID: $cmd_id"
-          echo "SSM Run Command Link- https://${{ steps.get-stack-region.outputs.REGION }}.console.aws.amazon.com/systems-manager/run-command/$cmd_id?region=${{ steps.get-stack-region.outputs.REGION }}"
-          echo "CMD_ID=$cmd_id" >> "$GITHUB_OUTPUT"
-
-      - name: Wait and Get Run Command Status
-        id: check_status
-        run: |
-          while true; do
-            echo "Checking SSM command status..."
-            OUTPUT=$(aws ssm get-command-invocation \
-              --command-id ${{ steps.send-command.outputs.cmd_id }} \
-              --instance-id ${{ inputs.InstanceId }} \
-              --output json)
+          if [ "$component" = "nb" ]; then
+            volume_size=$(jq -r --arg name "$stack_name" '.[] | select(.Name == $name) | .XvdnEc2VolumeSize' eventstore/$stack_prefix/clusters.json)
           
-            STATUS=$(echo "$OUTPUT" | jq -r '.Status')
+          elif [ "$component" = "eventstore" ]; then
+            volume_size=$(jq -r --arg name "$stack_name" '.[] | select(.Name == $name) | .XvdpEc2VolumeSize' eventstore/$stack_prefix/clusters.json)
           
-            echo "Current SSM Command Status: $STATUS"
-          
-            if [[ "$STATUS" == "InProgress" ]]; then
-              echo "Command is still in progress. Waiting 3 minutes before next check..."
-              sleep 180
-            else
-              break
+          elif [ "$component" = "mongo" ]; then
+            mongo_volume_sizes=$(jq -r --arg name "$stack_name" '.[] | select(.Name == $name) .Instances[] | .XvdpEc2VolumeSize' mongo/$stack_prefix/clusters.json)
+            if [ "$(echo "$mongo_volume_sizes" | sort | uniq | wc -l)" -ne 1 ]; then
+              echo "All nodes don’t have the same volume"
+              exit 1
             fi
-          done
+            volume_size=$(echo "$mongo_volume_sizes" | sort | uniq)
           
-          # Extract and print final output
-          STDOUT=$(echo "$OUTPUT" | jq -r '.StandardOutputContent')
-          STDERR=$(echo "$OUTPUT" | jq -r '.StandardErrorContent')
-          
-          echo "::group::Final SSM Command Output"
-          echo "$STDOUT"
-          echo "::endgroup::"
-          
-          echo "::group::Final SSM Command Errors (if any)"
-          echo "$STDERR"
-          echo "::endgroup::"
-          
-          if [[ "$STATUS" == "Success" ]]; then
-            echo "SSM command completed successfully."
           else
-            echo "SSM command ended with status: $STATUS. Exiting with failure."
+            echo "Unsupported component: $component"
             exit 1
           fi
-                
+          
+          echo "CURRENT_VOLUME_SIZE=${volume_size}" >> $GITHUB_OUTPUT
+
+      - name: Validate that the upgraded volume is not less than the current volume
+        run: |
+          set -euxo pipefail
+          stack_prefix=${{ needs.setup-job-environment.outputs.STACK_PREFIX }}
+          volume_size=${{ inputs.VolumeSize }}
+          stack_name=${{ inputs.StackName }}
+          current_volume_size=${{ steps.get-volume-size.outputs.CURRENT_VOLUME_SIZE }}                  
+          if [[ -n "$stack_name" && "volume_size" -gt 0 ]]; then
+            if [[ $mongo_volume_size -gt "current_volume_size" ]]; then
+                echo "Given value of volume is greater than the current volume"
+            else
+              echo "error: Given value of volume is less than the current volume"
+              exit 1
+            fi
+          fi   
+
+      - name: Prepare query to update volume in CloudFormation
+        id: fetch-query-to-update-volume
+        run: |
+          set -euxo pipefail
+          component=${{ inputs.Component }}
+          stack_name=${{ inputs.StackName }}
+          stack_prefix=${{ steps.get-stack-prefix.outputs.STACK_PREFIX }}
+          if [ "$component" = "mongo" ]; then
+            jq_query='map(if .Name == "'"$stack_name"'" then .Instances[] |= (if .EnableEc2instance == true then .XvdpEc2VolumeSize = '"${{ inputs.MongoVolume }}"' else . end) else . end)'
+            component_v2=${{ inputs.Component }}
+          elif [ "$component" = "nb" ]; then
+            jq_query='map(if .Name == "'"$stack_name"'" and .EnableEc2Volumes == true and .EnableNbVolume == true then .XvdnEc2VolumeSize = (if '"${{ inputs.NbVolume }}"' > .XvdnEc2VolumeSize then '"${{ inputs.NbVolume }}"' else .XvdnEc2VolumeSize end) else . end)'
+            component_v2=eventstore
+          elif [ "$component" = "eventstore" ]; then
+            jq_query='map(if .Name == "'"$stack_name"'" and .EnableEc2Volumes == true and .EnableNbVolume == true then .XvdpEc2VolumeSize = (if '"${{ inputs.EsVolume }}"' > .XvdpEc2VolumeSize then '"${{ inputs.EsVolume }}"' else .XvdpEc2VolumeSize end) else . end)'
+            component_v2=${{ inputs.Component }}
+          else
+            echo "Unsupported component: $component"
+          exit 1
+          fi
+          echo "JQ_QUERY=$jq_query" >> $GITHUB_OUTPUT
+          echo "COMPONENT=$component_v2" >> $GITHUB_OUTPUT
+
+      - name: Upgrade ${{ inputs.Component }} volumes of ${{ inputs.StackName }}
+        uses: ./.github/actions/cloudformation-build-commit-and-deploy
+        with:
+          query: ${{ steps.fetch-query-to-update-volume.output.JQ_QUERY }}
+          issue_id: ${{ inputs.IssueId }}
+          stack_name: ${{ inputs.StackName }}
+          component: '${{ steps.fetch-query-to-update-volume.output.COMPONENT }}'
+          commit_message: 'mongo: upgrade ${{ inputs.Component }} volume for ${{ inputs.StackName }}'
+          app_id: ${{ secrets.CLEVERTAP_SNE_BOT_ID }}
+          private_key: ${{ secrets.CLEVERTAP_SNE_BOT_PRIVATE_ACCESS_KEY }}
+          aws_cloudformation_service_iam_role: ${{ secrets.AWS_CLOUDFORMATION_SERVICE_IAM_ROLE }}
+          aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Run xfs_growfs command via SSM on mongo instances
+        if: ${{ inputs.Component == mongo }}
+        run: |
+          command_id=$(aws ssm send-command \
+              --region ${{ needs.setup-job-environment.outputs.REGION }} \
+              --targets "Key=tag:aws:cloudformation:stack-name,Values=${{ inputs.StackName }}" \
+              --document-name "AWS-RunShellScript" \
+              --comment "Resizing filesystem" \
+              --parameters commands="xfs_growfs $(readlink -f /dev/sdp)" \
+              --output text \
+              --max-errors "100%" \
+              --max-concurrency "100%" \
+              --query "Command.CommandId")
+          echo "SSM command sent. Command ID: $command_id"
+          echo "SSM Run Command Link- https://${{ needs.setup-job-environment.outputs.REGION }}.console.aws.amazon.com/systems-manager/run-command/$command_id?region=${{ needs.setup-job-environment.outputs.REGION }}"
+          python3 ./scripts/eventstore/check-ssm-output.py --region "${{ needs.setup-job-environment.outputs.REGION }}" --command-id "$command_id" --output "false"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Execute resize2fs on eventstore instances in stack via single SSM command
+        if: ${{ steps.fetch-query-to-update-volume.output.COMPONENT == eventstore }}
+        run: |
+          echo "Executing resize2fs on all instances in stack: $STACK_NAME in region: $REGION"
+          
+          command_id=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets Key=tag:aws:cloudformation:stack-name,Values=${{ inputs.StackName }} \
+                      Key=tag:role,Values=eventstore \
+            --comment "Resize filesystems for ES (/dev/sdp) and NB (/dev/sdn)" \
+            --parameters "{\"commands\":[\"resize2fs /dev/sdp\", \"resize2fs /dev/sdn\"]}" \
+            --region "${{ needs.setup-job-environment.outputs.REGION }}" \
+            --output text \
+            --max-errors "100%" \
+            --max-concurrency "100%" \
+            --query "Command.CommandId")
+          
+          echo "SSM command sent. Command ID: $command_id"
+          echo "SSM Run Command Link- https://${{ needs.setup-job-environment.outputs.REGION }}.console.aws.amazon.com/systems-manager/run-command/$command_id?region=${{ needs.setup-job-environment.outputs.REGION }}"
+          python3 ./scripts/eventstore/check-ssm-output.py --region "${{ needs.setup-job-environment.outputs.REGION }}" --command-id "$command_id" --output "false"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+               
+    
