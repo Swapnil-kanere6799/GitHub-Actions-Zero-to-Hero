@@ -1,0 +1,92 @@
+name: remediation/Capacity-reservation
+
+run-name: remediation/Capacity-reservation-${{ github.run_number }}
+
+on:
+  pull_request:
+    branches:
+      - '*'  # Matches all branches
+    types:
+      - opened
+      - synchronize
+      - reopened
+  push:
+    branches:
+      - '*'
+
+jobs:
+  capacity-reservation-remediation:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Get stack region
+        id: get-stack-region
+        run: |
+          set -euxo pipefail
+
+          echo "REGION=ap-south-1" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ steps.get-stack-region.outputs.REGION }}
+
+      - name: List Underutilized Capacity Reservations
+        id: list-underutilized-reservations
+        run: |
+          set -euxo pipefail
+          echo "Checking region: ${{ steps.get-stack-region.outputs.REGION }}"
+          capacity_reservation_ids=$(aws ec2 describe-capacity-reservations --region ${{ steps.get-stack-region.outputs.REGION }} --output json | jq -r '.CapacityReservations[] | select(.CapacityAllocations[]?.InstanceUtilization != "used") | .CapacityReservationId' | paste -sd ',' -)
+          echo "CAPACITY_RESERVATION_IDS=$capacity_reservation_ids" >> $GITHUB_OUTPUT
+
+      - name: Downgrade Underutilized Capacity Reservations
+        run: |
+          set -euxo pipefail
+          echo "Resizing underutilized capacity reservations in region: ${{ steps.get-stack-region.outputs.REGION }}"
+          
+          # Iterate over each underutilized capacity reservation ID
+          for reservation_id in $(echo ${{ steps.list-underutilized-reservations.outputs.CAPACITY_RESERVATION_IDS }} | tr ',' '\n'); do
+            echo "Processing reservation: $reservation_id"
+          
+            # Fetch current reservation details
+            reservation_details=$(aws ec2 describe-capacity-reservations --region ${{ steps.get-stack-region.outputs.REGION }} --capacity-reservation-ids $reservation_id --output json)
+          
+            # Extract TotalInstanceCount and the number of instances currently utilized
+            total_instances=$(echo $reservation_details | jq -r '.CapacityReservations[0].TotalInstanceCount')
+            used_instances=$(echo $reservation_details | jq -r '.CapacityReservations[0].CapacityAllocations[] | select(.InstanceUtilization == "used") | .InstanceCount' | awk '{s+=$1} END {print s}')
+          
+            # If used instances are less than total, downgrade the reservation capacity
+            if [ "$used_instances" -lt "$total_instances" ]; then
+              echo "Downgrading reservation $reservation_id from $total_instances to $used_instances"
+          
+              # Modify the capacity reservation to match the used instances
+              aws ec2 modify-capacity-reservation --region ${{ steps.get-stack-region.outputs.REGION }} --capacity-reservation-id $reservation_id --instance-count $used_instances
+            fi
+          done
+          sleep 15
+
+      - name: Verify Capacity Reservation Resize
+        run: |
+          echo "Verifying capacity reservation resizing in region: ${{ steps.get-stack-region.outputs.REGION }}"
+          
+          # Iterate over each underutilized capacity reservation ID
+          for reservation_id in $(echo ${{ steps.list-underutilized-reservations.outputs.CAPACITY_RESERVATION_IDS }} | tr ',' '\n'); do
+            echo "Verifying reservation: $reservation_id"
+          
+            # Fetch resized reservation details
+            resized_reservation_details=$(aws ec2 describe-capacity-reservations --region ${{ steps.get-stack-region.outputs.REGION }} --capacity-reservation-ids $reservation_id --output json)
+          
+            # Extract the resized TotalInstanceCount
+            resized_instance_count=$(echo $resized_reservation_details | jq -r '.CapacityReservations[0].TotalInstanceCount')
+          
+            # Compare resized instance count to used instances
+            if [ "$resized_instance_count" -eq "$used_instances" ]; then
+              echo "Successfully resized reservation $reservation_id to $used_instances instances."
+            else
+              echo "Failed to resize reservation $reservation_id. Expected $used_instances but got $resized_instance_count."
+              exit 1
+            fi
+          done
