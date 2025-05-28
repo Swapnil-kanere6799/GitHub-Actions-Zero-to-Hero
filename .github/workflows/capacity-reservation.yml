@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euxo pipefail
           echo "Checking region: ${{ steps.get-stack-region.outputs.REGION }}"
-          capacity_reservation_ids=$(aws ec2 describe-capacity-reservations --region ${{ steps.get-stack-region.outputs.REGION }} --output json | jq -r '.CapacityReservations[] | select(.CapacityAllocations[]?.InstanceUtilization != "used") | .CapacityReservationId' | paste -sd ',' -)
+          capacity_reservation_ids=$(aws ec2 describe-capacity-reservations --region ap-south-1 --query 'CapacityReservations[].CapacityReservationId' --output text | tr '\t' ',')
           echo "CAPACITY_RESERVATION_IDS=$capacity_reservation_ids" >> $GITHUB_OUTPUT
 
       - name: Downgrade Underutilized Capacity Reservations
