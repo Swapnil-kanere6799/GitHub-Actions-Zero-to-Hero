@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euxo pipefail
           echo "Checking region: ${{ steps.get-stack-region.outputs.REGION }}"
-          capacity_reservation_ids=$(aws ec2 describe-capacity-reservations --region ap-south-1 --output json | jq -r '.CapacityReservations[] | select(.CapacityAllocations | length > 0) | select((map(.Count) | add) > (map(select(.AllocationType == "used") | .Count) | add)) | .CapacityReservationId' | paste -sd ',' -)
+          capacity_reservation_ids=$(aws ec2 describe-capacity-reservations --region ap-south-1 --query 'CapacityReservations[].CapacityReservationId' --output text | tr '\t' ',')
           echo "CAPACITY_RESERVATION_IDS=$capacity_reservation_ids" >> $GITHUB_OUTPUT
 
       - name: Downgrade Underutilized Capacity Reservations
@@ -53,8 +53,8 @@ jobs:
             reservation_details=$(aws ec2 describe-capacity-reservations --region ${{ steps.get-stack-region.outputs.REGION }} --capacity-reservation-ids $reservation_id --output json)
 
             total_instances=$(echo $reservation_details | jq -r '.CapacityReservations[0].TotalInstanceCount')
-            used_instances=$(echo $reservation_details | jq -r '.CapacityReservations[0].CapacityAllocations[] | select(.AllocationType == "used") | .Count' | awk '{s+=$1} END {print s}')
-            used_instances=${used_instances:-0}
+            available_instances=$(echo $reservation_details | jq -r '.CapacityReservations[0].AvailableInstanceCount')
+            used_instances=$((total_instances - available_instances))
 
             if [ "$used_instances" -lt "$total_instances" ]; then
               echo "Downgrading reservation $reservation_id from $total_instances to $used_instances"
