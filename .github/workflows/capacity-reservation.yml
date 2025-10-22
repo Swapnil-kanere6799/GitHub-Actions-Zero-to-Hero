@@ -83,3 +83,15 @@ jobs:
               exit 1
             fi
           done
+
+
+      - name: Jira Ticket Creation
+        uses: bryannice/gitactions-jira-issue-creation@master
+        env:
+          JIRA_ACCOUNT_URL: https://wizrocket.atlassian.net/
+          JIRA_API_TOKEN: JIRA_API_TOKEN
+          JIRA_ISSUE_DESCRIPTION: Switch all account from Emergency to source redis cluster
+          JIRA_ISSUE_SUMMARY: Start the and switch back Account from 
+          JIRA_ISSUE_TYPE: Task
+          JIRA_PROJECT: SNE
+          JIRA_USERNAME: swapnil.kanere@clevertap.com
